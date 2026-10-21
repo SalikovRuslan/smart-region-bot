@@ -1,5 +1,6 @@
-"""Telegram-бот: оновлює закріплене повідомлення з ТОП-10 і проєктом №53
-та надсилає сповіщення, коли змінюється його місце.
+"""Telegram-бот: раз на годину публікує новий пост з ТОП-10 і проєктом №53
+(без звуку), а коли змінюється його місце — одразу позачерговий пост зі звуком.
+Старі пости не редагуються, тож у каналі зберігається вся історія.
 
 Запуск:          TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=... python bot.py
 Тестовий режим:  python bot.py              (без токена — лише друкує повідомлення)
@@ -10,7 +11,7 @@ import html
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -23,6 +24,9 @@ TOP_N = 10
 TITLE_LEN = 40
 KYIV = ZoneInfo("Europe/Kyiv")
 NO_PREVIEW = {"is_disabled": True}
+POST_EVERY = timedelta(hours=1)
+# GitHub запускає розклад неточно, тому пост виходить, якщо минуло хоча б 50 хв
+SCHEDULE_SLACK = timedelta(minutes=10)
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
@@ -83,23 +87,8 @@ def gap_lines(projects, target):
     return lines
 
 
-def pinned_text(projects, target, now):
-    lines = [f"🏆 <b>ТОП-{TOP_N} шкільного бюджету</b>", ""]
-    for p in projects[:TOP_N]:
-        mark = "👉 " if p is target else ""
-        lines.append(f"{p['rank']}. {mark}<b>{p['votes']}</b> · {project_line(p)}")
-    lines += [
-        "",
-        f'📍 <b><a href="{project_url(target["id"])}">Проєкт №{target["id"]}</a>: {target["rank"]} місце</b> з {len(projects)}',
-        f"🔥 {votes(target['votes'])}",
-        *gap_lines(projects, target),
-        "",
-        f"🕒 Оновлено {now:%d.%m %H:%M} (Київ)",
-    ]
-    return "\n".join(lines)
-
-
-def change_text(projects, target, old_rank, old_above, new_above):
+def change_lines(projects, target, old_rank, old_above, new_above):
+    """Заголовок позачергового поста: як змінилось місце і хто кого обігнав."""
     by_id = {p["id"]: p for p in projects}
     rank = target["rank"]
     if rank < old_rank:
@@ -109,7 +98,7 @@ def change_text(projects, target, old_rank, old_above, new_above):
     else:
         head = f"🔄 <b>Зміни навколо №{TARGET_ID} ({rank} місце)</b>"
 
-    lines = [head, ""]
+    lines = [head]
     for pid in sorted(old_above - new_above):
         p = by_id[pid]
         verb = "Зрівнявся з" if p["votes"] == target["votes"] else "Обігнав"
@@ -117,7 +106,23 @@ def change_text(projects, target, old_rank, old_above, new_above):
     for pid in sorted(new_above - old_above):
         p = by_id[pid]
         lines.append(f"❌ Його обігнав {project_line(p)} ({p['votes']})")
-    lines += ["", f"🔥 {votes(target['votes'])}", *gap_lines(projects, target)]
+    return lines
+
+
+def post_text(projects, target, now, change=None):
+    lines = [*change, "", "━━━━━━━━━━━━━━━", ""] if change else []
+    lines += [f"🏆 <b>ТОП-{TOP_N} шкільного бюджету</b>", ""]
+    for p in projects[:TOP_N]:
+        mark = "👉 " if p is target else ""
+        lines.append(f"{p['rank']}. {mark}<b>{p['votes']}</b> · {project_line(p)}")
+    lines += [
+        "",
+        f'📍 <b><a href="{project_url(target["id"])}">Проєкт №{target["id"]}</a>: {target["rank"]} місце</b> з {len(projects)}',
+        f"🔥 {votes(target['votes'])}",
+        *gap_lines(projects, target),
+        "",
+        f"🕒 {now:%d.%m %H:%M} (Київ)",
+    ]
     return "\n".join(lines)
 
 
@@ -134,30 +139,6 @@ def save_state(state):
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-# --- Telegram ---
-
-def send(text):
-    return tg("sendMessage", chat_id=CHAT_ID, text=text, parse_mode="HTML", link_preview_options=NO_PREVIEW)
-
-
-def update_pinned(state, text):
-    """Редагує закріплене повідомлення; якщо його немає — надсилає нове і закріплює."""
-    if state.get("message_id"):
-        try:
-            tg("editMessageText", chat_id=CHAT_ID, message_id=state["message_id"], text=text,
-               parse_mode="HTML", link_preview_options=NO_PREVIEW)
-            return
-        except TelegramError as e:
-            if "message is not modified" in str(e):
-                return
-            if "message to edit not found" not in str(e) and "message can't be edited" not in str(e):
-                raise
-            print(f"Закріплене повідомлення недоступне ({e}), надсилаю нове")
-    msg = send(text)
-    tg("pinChatMessage", chat_id=CHAT_ID, message_id=msg["message_id"], disable_notification=True)
-    state["message_id"] = msg["message_id"]
-
-
 def main():
     if os.environ.get("GITHUB_ACTIONS") and not (TOKEN and CHAT_ID):
         sys.exit("::error::Не задано секрети TELEGRAM_BOT_TOKEN і TELEGRAM_CHAT_ID")
@@ -170,27 +151,35 @@ def main():
         return
 
     state = load_state()
+    state.pop("message_id", None)  # залишок від версії із закріпленим повідомленням
+    now = datetime.now(KYIV)
     above = sorted(p["id"] for p in projects if p["votes"] > target["votes"])
-    text = pinned_text(projects, target, datetime.now(KYIV))
-    notification = None
-    if "above" in state and set(state["above"]) != set(above):
-        notification = change_text(projects, target, state["rank"], set(state["above"]), set(above))
 
+    change = None
+    if "above" in state and set(state["above"]) != set(above):
+        change = change_lines(projects, target, state["rank"], set(state["above"]), set(above))
+    last_post = state.get("last_post")
+    due = not last_post or now - datetime.fromisoformat(last_post) >= POST_EVERY - SCHEDULE_SLACK
+
+    if not (change or due):
+        print(f"Місце №{TARGET_ID} не змінилось ({target['rank']}), до планового поста ще не час")
+        return
+
+    text = post_text(projects, target, now, change)
     if not (TOKEN and CHAT_ID):
         print("Тестовий режим: немає TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID\n")
         print(text)
-        if notification:
-            print("\n--- сповіщення ---\n" + notification)
         return
 
-    update_pinned(state, text)
-    if notification:
-        send(notification)
+    # Плановий пост — без звуку, зміна місця — зі звуком
+    tg("sendMessage", chat_id=CHAT_ID, text=text, parse_mode="HTML",
+       link_preview_options=NO_PREVIEW, disable_notification=not change)
     state["rank"] = target["rank"]
     state["above"] = above
+    state["last_post"] = now.isoformat(timespec="minutes")
     save_state(state)
-    print(f"Готово: №{TARGET_ID} на {target['rank']} місці, {votes(target['votes'])}"
-          + (", надіслано сповіщення" if notification else ""))
+    print(f"Опубліковано {'пост про зміну місця' if change else 'плановий пост'}: "
+          f"№{TARGET_ID} на {target['rank']} місці, {votes(target['votes'])}")
 
 
 def print_chat_ids():
