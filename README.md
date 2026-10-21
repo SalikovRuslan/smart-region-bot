@@ -57,3 +57,7 @@ git remote add origin https://github.com/<логін>/smart-region-bot.git && gi
 - **Зупинити бота.** Actions → Telegram bot → `···` → **Disable workflow**.
 - **Стан між запусками** зберігається в `state.json`: бот сам комітить його, коли змінюється місце №53.
 - **Перевірити локально без Telegram:** `./venv/bin/python bot.py` надрукує повідомлення в консоль.
+
+## Ліцензія
+
+[MIT](LICENSE)
