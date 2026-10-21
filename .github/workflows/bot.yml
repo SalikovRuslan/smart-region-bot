@@ -20,6 +20,9 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
+        with:
+          # Завжди свіжий main зі state.json, навіть при Re-run старого запуску
+          ref: main
 
       - uses: actions/setup-python@v6
         with:
