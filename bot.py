@@ -1,4 +1,4 @@
-"""Telegram-бот: раз на годину публікує новий пост з ТОП-10 і проєктом №53
+"""Telegram-бот: раз на годину публікує новий пост з рейтингом від 1 місця до проєкту №53
 (без звуку), а коли змінюється його місце — одразу позачерговий пост зі звуком.
 Старі пости не редагуються, тож у каналі зберігається вся історія.
 
@@ -24,6 +24,7 @@ TOP_N = 10
 TITLE_LEN = 40
 KYIV = ZoneInfo("Europe/Kyiv")
 NO_PREVIEW = {"is_disabled": True}
+TELEGRAM_LIMIT = 4096  # максимальна довжина повідомлення
 POST_EVERY = timedelta(hours=1)
 # GitHub запускає розклад неточно, тому пост виходить, якщо минуло хоча б 50 хв
 SCHEDULE_SLACK = timedelta(minutes=10)
@@ -50,8 +51,8 @@ def tg(method, **params):
 
 # --- Форматування ---
 
-def short(title):
-    return title if len(title) <= TITLE_LEN else title[: TITLE_LEN - 1] + "…"
+def short(title, max_len=TITLE_LEN):
+    return title if len(title) <= max_len else title[: max_len - 1] + "…"
 
 
 def votes_word(n):
@@ -66,8 +67,8 @@ def votes(n):
     return f"{n} {votes_word(n)}"
 
 
-def project_line(p):
-    return f"№{p['id']} {html.escape(short(p['title']))}"
+def project_line(p, title_len=TITLE_LEN):
+    return f"№{p['id']} {html.escape(short(p['title'], title_len))}"
 
 
 def gap_lines(projects, target):
@@ -110,11 +111,23 @@ def change_lines(projects, target, old_rank, old_above, new_above):
 
 
 def post_text(projects, target, now, change=None):
+    # Якщо №53 опуститься низько, довгий список може не влізти в ліміт Telegram — тоді скорочуємо назви
+    for title_len in (TITLE_LEN, 25, 15):
+        text = build_post(projects, target, now, change, title_len)
+        if len(text) <= TELEGRAM_LIMIT:
+            break
+    return text
+
+
+def build_post(projects, target, now, change, title_len):
     lines = [*change, "", "━━━━━━━━━━━━━━━", ""] if change else []
-    lines += [f"🏆 <b>ТОП-{TOP_N} шкільного бюджету</b>", ""]
-    for p in projects[:TOP_N]:
+    lines += [f"🏆 <b>Рейтинг до №{target['id']}</b>", ""]
+    # Усі місця від першого до цільового проєкту включно (разом з тими, хто з ним на одному місці)
+    for p in projects:
+        if p["rank"] > target["rank"]:
+            break
         mark = "👉 " if p is target else ""
-        lines.append(f"{p['rank']}. {mark}<b>{p['votes']}</b> · {project_line(p)}")
+        lines.append(f"{p['rank']}. {mark}<b>{p['votes']}</b> · {project_line(p, title_len)}")
     lines += [
         "",
         f'📍 <b><a href="{project_url(target["id"])}">Проєкт №{target["id"]}</a>: {target["rank"]} місце</b> з {len(projects)}',

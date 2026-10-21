@@ -105,16 +105,22 @@ def main():
     if failed:
         print(f"❌ Не вдалося завантажити: {sorted(failed)} — рейтинг неповний!")
 
-    # --- ВИВЕДЕННЯ ТОП-10 ---
-    print("\n🏆 ТОП-10 ПРОЄКТІВ ЗА КІЛЬКІСТЮ ГОЛОСІВ:")
+    target_project = next((p for p in sorted_projects if p["id"] == TARGET_ID), None)
+    # Усі місця від першого до цільового проєкту (якщо він не завантажився — ТОП-10)
+    last_rank = target_project["rank"] if target_project else 10
+
+    # --- ВИВЕДЕННЯ РЕЙТИНГУ ДО ЦІЛЬОВОГО ПРОЄКТУ ---
+    print(f"\n🏆 РЕЙТИНГ ДО ПРОЄКТУ №{TARGET_ID}:")
     print("=" * 75)
-    for proj in sorted_projects[:10]:
+    for proj in sorted_projects:
+        if proj["rank"] > last_rank:
+            break
         short_title = proj["title"] if len(proj["title"]) <= 45 else proj["title"][:42] + "..."
-        print(f"{proj['rank']:2d}. [ID {proj['id']:<3d}] {short_title:<45} — 🔥 {proj['votes']}")
+        mark = "👉" if proj is target_project else "  "
+        print(f"{mark}{proj['rank']:2d}. [ID {proj['id']:<3d}] {short_title:<45} — 🔥 {proj['votes']}")
     print("=" * 75)
 
     # --- ВИВЕДЕННЯ РЕЗУЛЬТАТУ ЦІЛЬОВОГО ПРОЄКТУ ---
-    target_project = next((p for p in sorted_projects if p["id"] == TARGET_ID), None)
 
     print(f"\n📍 ПРОЄКТ №{TARGET_ID}:")
     print("-" * 75)
