@@ -7,6 +7,8 @@ from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from ranking import CATEGORY_NAMES, category_of, funding_rival, official_ranking, votes_to_overtake
+
 BASE_URL = "https://smartregion.pl.ua"
 # Шкільний бюджет (sb), конкурс №12 — проєкти з ID від 1 до 64
 SECTION = "sb"
@@ -61,7 +63,7 @@ def project_url(proj_id):
 
 
 def scrape(verbose=False):
-    """Парсить усі проєкти. Повертає (рейтинг за спаданням голосів, {id: помилка})."""
+    """Парсить усі проєкти. Повертає (проєкти за спаданням голосів, {id: помилка})."""
     all_projects = []
     failed = {}
 
@@ -80,16 +82,7 @@ def scrape(verbose=False):
             if verbose:
                 print(f"⚡ ID {result['id']:<3d} {result['title'][:40]:<40} — 🔥 {result['votes']}")
 
-    sorted_projects = sorted(all_projects, key=lambda x: (-x["votes"], x["id"]))
-
-    # Однакова кількість голосів — однакове місце (1, 2, 2, 4)
-    for i, proj in enumerate(sorted_projects):
-        if i > 0 and proj["votes"] == sorted_projects[i - 1]["votes"]:
-            proj["rank"] = sorted_projects[i - 1]["rank"]
-        else:
-            proj["rank"] = i + 1
-
-    return sorted_projects, failed
+    return sorted(all_projects, key=lambda x: (-x["votes"], x["id"])), failed
 
 
 def main():
@@ -97,43 +90,48 @@ def main():
     print("=" * 75)
     started = time.perf_counter()
 
-    sorted_projects, failed = scrape(verbose=True)
+    projects, failed = scrape(verbose=True)
 
     elapsed = time.perf_counter() - started
     print("=" * 75)
-    print(f"✅ Отримано {len(sorted_projects)} з {END_ID - START_ID + 1} проєктів за {elapsed:.1f} с")
+    print(f"✅ Отримано {len(projects)} з {END_ID - START_ID + 1} проєктів за {elapsed:.1f} с")
     if failed:
         print(f"❌ Не вдалося завантажити: {sorted(failed)} — рейтинг неповний!")
 
-    target_project = next((p for p in sorted_projects if p["id"] == TARGET_ID), None)
-    # Усі місця від першого до цільового проєкту (якщо він не завантажився — ТОП-10)
-    last_rank = target_project["rank"] if target_project else 10
+    category = category_of(TARGET_ID)
+    if not category:
+        print(f"❌ Проєкту {TARGET_ID} немає в contest.json")
+        return
+    rows, budget = official_ranking(projects, category)
+    target = next((r for r in rows if r["id"] == TARGET_ID), None)
 
-    # --- ВИВЕДЕННЯ РЕЙТИНГУ ДО ЦІЛЬОВОГО ПРОЄКТУ ---
-    print(f"\n🏆 РЕЙТИНГ ДО ПРОЄКТУ №{TARGET_ID}:")
+    # --- ОФІЦІЙНИЙ РЕЙТИНГ КАТЕГОРІЇ ДО ЦІЛЬОВОГО ПРОЄКТУ ---
+    print(f"\n🏆 {CATEGORY_NAMES[category].upper()}: РЕЙТИНГ ДО ПРОЄКТУ №{TARGET_ID} (бал = голоси × √коефіцієнт)")
     print("=" * 75)
-    for proj in sorted_projects:
-        if proj["rank"] > last_rank:
-            break
-        short_title = proj["title"] if len(proj["title"]) <= 45 else proj["title"][:42] + "..."
-        mark = "👉" if proj is target_project else "  "
-        print(f"{mark}{proj['rank']:2d}. [ID {proj['id']:<3d}] {short_title:<45} — 🔥 {proj['votes']}")
+    for r in rows[: target["rank"] if target else 10]:
+        short_title = r["title"] if len(r["title"]) <= 40 else r["title"][:37] + "..."
+        mark = "👉" if r is target else "  "
+        icon = {"full": "✅", "remainder": "🟡"}.get(r["funding"], "")
+        print(f"{mark}{r['rank']:2d}. [ID {r['id']:<3d}] {short_title:<40} {r['score']:8.0f} балів ({r['votes']} гол.) {icon}")
     print("=" * 75)
+    print(f"✅ повне фінансування, 🟡 залишок — оцінка, бюджет категорії ≈ {budget:.0f} тис. грн")
 
     # --- ВИВЕДЕННЯ РЕЗУЛЬТАТУ ЦІЛЬОВОГО ПРОЄКТУ ---
-
     print(f"\n📍 ПРОЄКТ №{TARGET_ID}:")
     print("-" * 75)
-    if target_project:
-        print(f"🏅 Місце в рейтингу: {target_project['rank']} з {len(sorted_projects)}")
-        print(f"📋 {target_project['title']}")
-        print(f"🔥 Голосів: {target_project['votes']}")
-        leader = sorted_projects[0]
-        if target_project is not leader:
-            print(f"📉 Відставання від лідера (ID {leader['id']}): {leader['votes'] - target_project['votes']}")
-        if target_project["rank"] > 1:
-            above = next(p for p in reversed(sorted_projects) if p["votes"] > target_project["votes"])
-            print(f"⬆️  До попереднього місця (ID {above['id']}) не вистачає: {above['votes'] - target_project['votes']}")
+    if target:
+        print(f"🏅 Місце: {target['rank']} з {len(rows)} ({CATEGORY_NAMES[category].lower()})")
+        print(f"📋 {target['title']}")
+        print(f"🔥 Голосів: {target['votes']} × √{target['coef']:.2f} = {target['score']:.0f} балів")
+        if target["rank"] > 1:
+            above = rows[target["rank"] - 2]
+            print(f"⬆️  Обігнати {above['rank']} місце (ID {above['id']}): треба ще голосів — {votes_to_overtake(target, above)}")
+        rival = funding_rival(rows, budget, target)
+        if rival:
+            print(f"💰 До повного фінансування: обігнати ID {rival['id']} ({rival['rank']} місце), "
+                  f"треба ще голосів — {votes_to_overtake(target, rival)}")
+        else:
+            print("💰 Зараз у зоні повного фінансування")
     else:
         print(f"❌ Проєкт {TARGET_ID} не завантажився: {failed.get(TARGET_ID, 'невідома причина')}")
     print("-" * 75)

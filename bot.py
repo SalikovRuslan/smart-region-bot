@@ -1,5 +1,6 @@
-"""Telegram-бот: раз на годину публікує новий пост з рейтингом від 1 місця до проєкту №53
-(без звуку), а коли змінюється його місце — одразу позачерговий пост зі звуком.
+"""Telegram-бот: раз на годину публікує офіційний рейтинг категорії проєкту №53
+(бал = голоси × √коефіцієнт громади) від 1 місця до №53 — без звуку,
+а коли змінюється його місце — одразу позачерговий пост зі звуком.
 Старі пости не редагуються, тож у каналі зберігається вся історія.
 
 Запуск:          TELEGRAM_BOT_TOKEN=... TELEGRAM_CHAT_ID=... python bot.py
@@ -9,6 +10,7 @@
 import getpass
 import html
 import json
+import math
 import os
 import sys
 from datetime import datetime, timedelta
@@ -18,9 +20,11 @@ from zoneinfo import ZoneInfo
 import requests
 
 from parser import TARGET_ID, project_url, scrape
+from ranking import CATEGORY_NAMES, category_of, funding_rival, official_ranking, votes_to_overtake
 
 STATE_FILE = Path(__file__).with_name("state.json")
-TOP_N = 10
+# Версія формату state.json: зі зміною логіки рейтингу старий стан не порівнюємо
+STATE_VERSION = 2
 TITLE_LEN = 40
 KYIV = ZoneInfo("Europe/Kyiv")
 NO_PREVIEW = {"is_disabled": True}
@@ -28,6 +32,7 @@ TELEGRAM_LIMIT = 4096  # максимальна довжина повідомл�
 POST_EVERY = timedelta(hours=1)
 # GitHub запускає розклад неточно, тому пост виходить, якщо минуло хоча б 50 хв
 SCHEDULE_SLACK = timedelta(minutes=10)
+FUNDING_ICONS = {"full": " ✅", "remainder": " 🟡", None: ""}
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
@@ -69,30 +74,37 @@ def votes(n):
     return f"{n} {votes_word(n)}"
 
 
+def points(score):
+    return f"{score:,.0f}".replace(",", " ")
+
+
 def project_line(p, title_len=TITLE_LEN):
     return f"№{p['id']} {html.escape(short(p['title'], title_len))}"
 
 
-def gap_lines(projects, target):
-    """Хто прямо попереду і позаду цільового проєкту та на скільки."""
-    above = [p for p in projects if p["votes"] > target["votes"]]
-    below = [p for p in projects if p["votes"] < target["votes"]]
+def gap_lines(rows, budget, target):
+    """Хто прямо попереду й позаду та скільки голосів бракує до межі фінансування."""
+    i = rows.index(target)
     lines = []
-    if above:
-        p = above[-1]
-        lines.append(f"⬆️ {p['rank']} місце (№{p['id']}) попереду на {votes(p['votes'] - target['votes'])}")
-    if below:
-        p = below[0]
-        lines.append(f"⬇️ {p['rank']} місце (№{p['id']}) позаду на {votes(target['votes'] - p['votes'])}")
-    if target["rank"] > TOP_N:
-        p = projects[TOP_N - 1]
-        lines.append(f"🎯 До ТОП-{TOP_N} (№{p['id']}) бракує {votes(p['votes'] - target['votes'])}")
+    if i > 0:
+        p = rows[i - 1]
+        lines.append(f"⬆️ Обігнати {p['rank']} місце (№{p['id']}): треба ще {votes(votes_to_overtake(target, p))}")
+    if i + 1 < len(rows):
+        p = rows[i + 1]
+        lines.append(f"⬇️ {p['rank']} місце (№{p['id']}) обжене, якщо набере ще {votes(votes_to_overtake(p, target))}")
+    rival = funding_rival(rows, budget, target)
+    if rival is None:
+        lines.append("💰 Зараз у зоні повного фінансування ✅")
+    else:
+        prefix = "Зараз отримує лише залишок коштів 🟡. " if target["funding"] == "remainder" else ""
+        lines.append(f"💰 {prefix}До повного фінансування: обігнати №{rival['id']} ({rival['rank']} місце), "
+                     f"треба ще {votes(votes_to_overtake(target, rival))}")
     return lines
 
 
-def change_lines(projects, target, old_rank, old_above, new_above):
+def change_lines(rows, target, old_rank, old_above, new_above):
     """Заголовок позачергового поста: як змінилось місце і хто кого обігнав."""
-    by_id = {p["id"]: p for p in projects}
+    by_id = {r["id"]: r for r in rows}
     rank = target["rank"]
     if rank < old_rank:
         head = f"🎉 <b>№{TARGET_ID} піднявся: {old_rank} → {rank} місце</b>"
@@ -103,39 +115,45 @@ def change_lines(projects, target, old_rank, old_above, new_above):
 
     lines = [head]
     for pid in sorted(old_above - new_above):
-        p = by_id[pid]
-        verb = "Зрівнявся з" if p["votes"] == target["votes"] else "Обігнав"
-        lines.append(f"✅ {verb} {project_line(p)} ({p['votes']})")
+        r = by_id[pid]
+        lines.append(f"✅ Обігнав {project_line(r)} ({points(r['score'])} балів)")
     for pid in sorted(new_above - old_above):
-        p = by_id[pid]
-        lines.append(f"❌ Його обігнав {project_line(p)} ({p['votes']})")
+        r = by_id[pid]
+        lines.append(f"❌ Його обігнав {project_line(r)} ({points(r['score'])} балів)")
     return lines
 
 
-def post_text(projects, target, now, change=None):
+def post_text(rows, budget, target, now, change=None):
     # Якщо №53 опуститься низько, довгий список може не влізти в ліміт Telegram — тоді скорочуємо назви
     for title_len in (TITLE_LEN, 25, 15):
-        text = build_post(projects, target, now, change, title_len)
+        text = build_post(rows, budget, target, now, change, title_len)
         if len(text) <= TELEGRAM_LIMIT:
             break
     return text
 
 
-def build_post(projects, target, now, change, title_len):
+def build_post(rows, budget, target, now, change, title_len):
+    category = CATEGORY_NAMES[category_of(target["id"])]
     lines = [*change, "", "━━━━━━━━━━━━━━━", ""] if change else []
-    lines += [f"🏆 <b>Рейтинг до №{target['id']}</b>", ""]
-    # Усі місця від першого до цільового проєкту включно (разом з тими, хто з ним на одному місці)
-    for p in projects:
-        if p["rank"] > target["rank"]:
-            break
-        mark = "👉 " if p is target else ""
-        lines.append(f"{p['rank']}. {mark}<b>{p['votes']}</b> · {project_line(p, title_len)}")
+    lines += [f"🏆 <b>{category}: рейтинг до №{target['id']}</b>",
+              "<i>бал = голоси × √коефіцієнт громади</i>", ""]
+    # Усі місця від першого до цільового проєкту включно
+    for r in rows[: target["rank"]]:
+        mark = "👉 " if r is target else ""
+        lines.append(f"{r['rank']}. {mark}<b>{points(r['score'])}</b> · {project_line(r, title_len)}"
+                     f" · {r['votes']} гол.{FUNDING_ICONS[r['funding']]}")
+        nxt = rows[r["rank"]] if r["rank"] < target["rank"] else None
+        if r["funding"] and nxt and not nxt["funding"]:
+            lines.append("┄┄┄ межа фінансування ┄┄┄")
     lines += [
         "",
-        f'📍 <b><a href="{project_url(target["id"])}">Проєкт №{target["id"]}</a>: {target["rank"]} місце</b> з {len(projects)}',
-        f"🔥 {votes(target['votes'])}",
-        *gap_lines(projects, target),
+        f'📍 <b><a href="{project_url(target["id"])}">Проєкт №{target["id"]}</a>: {target["rank"]} місце</b>'
+        f" з {len(rows)}",
+        f"🔥 {votes(target['votes'])} × {math.sqrt(target['coef']):.2f}".replace(".", ",")
+        + f" = {points(target['score'])} балів",
+        *gap_lines(rows, budget, target),
         "",
+        "<i>✅ повне фінансування, 🟡 залишок коштів — оцінка за схемою розподілу 2025 року</i>",
         f"🕒 {now:%d.%m %H:%M} (Київ)",
     ]
     return "\n".join(lines)
@@ -145,9 +163,10 @@ def build_post(projects, target, now, change, title_len):
 
 def load_state():
     try:
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return {}
+    return state if state.get("version") == STATE_VERSION else {}
 
 
 def save_state(state):
@@ -157,22 +176,25 @@ def save_state(state):
 def main():
     if os.environ.get("GITHUB_ACTIONS") and not (TOKEN and CHAT_ID):
         sys.exit("::error::Не задано секрети TELEGRAM_BOT_TOKEN і TELEGRAM_CHAT_ID")
+    category = category_of(TARGET_ID)
+    if not category:
+        sys.exit(f"::error::Проєкту №{TARGET_ID} немає в contest.json")
 
     projects, failed = scrape()
-    target = next((p for p in projects if p["id"] == TARGET_ID), None)
+    rows, budget = official_ranking(projects, category)
+    target = next((r for r in rows if r["id"] == TARGET_ID), None)
     if failed or not target:
         # Неповні дані дадуть хибне місце — краще пропустити цей запуск
         print(f"::warning::Не завантажилися проєкти {sorted(failed)}, оновлення пропущено")
         return
 
     state = load_state()
-    state.pop("message_id", None)  # залишок від версії із закріпленим повідомленням
     now = datetime.now(KYIV)
-    above = sorted(p["id"] for p in projects if p["votes"] > target["votes"])
+    above = sorted(r["id"] for r in rows[: target["rank"] - 1])
 
     change = None
     if "above" in state and set(state["above"]) != set(above):
-        change = change_lines(projects, target, state["rank"], set(state["above"]), set(above))
+        change = change_lines(rows, target, state["rank"], set(state["above"]), set(above))
     last_post = state.get("last_post")
     due = FORCE_POST or not last_post or now - datetime.fromisoformat(last_post) >= POST_EVERY - SCHEDULE_SLACK
 
@@ -180,7 +202,7 @@ def main():
         print(f"Місце №{TARGET_ID} не змінилось ({target['rank']}), до планового поста ще не час")
         return
 
-    text = post_text(projects, target, now, change)
+    text = post_text(rows, budget, target, now, change)
     if not (TOKEN and CHAT_ID):
         print("Тестовий режим: немає TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID\n")
         print(text)
@@ -189,12 +211,11 @@ def main():
     # Плановий пост — без звуку, зміна місця — зі звуком
     tg("sendMessage", chat_id=CHAT_ID, text=text, parse_mode="HTML",
        link_preview_options=NO_PREVIEW, disable_notification=not change)
-    state["rank"] = target["rank"]
-    state["above"] = above
-    state["last_post"] = now.isoformat(timespec="minutes")
+    state.update(version=STATE_VERSION, rank=target["rank"], above=above,
+                 last_post=now.isoformat(timespec="minutes"))
     save_state(state)
     print(f"Опубліковано {'пост про зміну місця' if change else 'плановий пост'}: "
-          f"№{TARGET_ID} на {target['rank']} місці, {votes(target['votes'])}")
+          f"№{TARGET_ID} на {target['rank']} місці, {points(target['score'])} балів")
 
 
 def print_chat_ids():
