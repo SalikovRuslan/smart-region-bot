@@ -31,6 +31,8 @@ SCHEDULE_SLACK = timedelta(minutes=10)
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+# true — публікувати пост, навіть якщо година ще не минула (ручний запуск)
+FORCE_POST = os.environ.get("FORCE_POST", "").strip().lower() == "true"
 
 
 class TelegramError(Exception):
@@ -172,7 +174,7 @@ def main():
     if "above" in state and set(state["above"]) != set(above):
         change = change_lines(projects, target, state["rank"], set(state["above"]), set(above))
     last_post = state.get("last_post")
-    due = not last_post or now - datetime.fromisoformat(last_post) >= POST_EVERY - SCHEDULE_SLACK
+    due = FORCE_POST or not last_post or now - datetime.fromisoformat(last_post) >= POST_EVERY - SCHEDULE_SLACK
 
     if not (change or due):
         print(f"Місце №{TARGET_ID} не змінилось ({target['rank']}), до планового поста ще не час")
